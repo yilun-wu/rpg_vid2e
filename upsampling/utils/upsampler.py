@@ -7,7 +7,9 @@ import warnings
 import cv2
 import numpy as np
 import torch
+import torch.nn as nn
 import torchvision.transforms as transforms
+from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 
 from . import Sequence
@@ -41,6 +43,137 @@ class Upsampler:
         self.negmean = self._move_to_device(torch.Tensor([x * -1 for x in mean]).view(3, 1, 1), self.device)
         revNormalize = transforms.Normalize(mean=negmean, std=std)
         self.TP = transforms.Compose([revNormalize])
+
+    class AdapUpSample(nn.Module):
+        def __init__(self, device):
+            super(Upsampler.AdapUpSample, self).__init__()
+            self.device = torch.device(device)
+            self.flowComp = UNet(6, 4)
+            self.ArbTimeFlowIntrp = UNet(20, 5)
+            self.flowBackWarp_dict = dict()
+            self._load_net_from_checkpoint()
+            negmean = [x * -1 for x in mean]
+            self.negmean = self._move_to_device(torch.Tensor([x * -1 for x in mean]).view(3, 1, 1), self.device)
+            revNormalize = transforms.Normalize(mean=negmean, std=std)
+            self.TP = transforms.Compose([revNormalize])
+
+        def _load_net_from_checkpoint(self):
+            ckpt_file = 'checkpoint/SuperSloMo.ckpt'
+
+            if not os.path.isfile(ckpt_file):
+                print('Downloading SuperSlowMo checkpoint to {} ...'.format(ckpt_file))
+                g = urllib.request.urlopen('http://rpg.ifi.uzh.ch/data/VID2E/SuperSloMo.ckpt')
+                with open(ckpt_file, 'w+b') as ckpt:
+                    ckpt.write(g.read())
+                print('Done with downloading!')
+            assert os.path.isfile(ckpt_file)
+
+            self._move_to_device(self.flowComp, self.device)
+            for param in self.flowComp.parameters():
+                param.requires_grad = False
+
+            self._move_to_device(self.ArbTimeFlowIntrp, self.device)
+            for param in self.ArbTimeFlowIntrp.parameters():
+                param.requires_grad = False
+
+            checkpoint = torch.load(ckpt_file, map_location=self.device)
+            self.ArbTimeFlowIntrp.load_state_dict(checkpoint['state_dictAT'])
+            self.flowComp.load_state_dict(checkpoint['state_dictFC'])
+
+        @classmethod
+        def _move_to_device(
+                cls,
+                _input,
+                device: torch.device,
+                dtype: torch.dtype = None):
+            if not torch.cuda.is_available() and not device == torch.device('cpu'):
+                warnings.warn("CUDA not available! Input remains on CPU!", Warning)
+
+            if isinstance(_input, torch.nn.Module):
+                # Performs in-place modification of the module but we still return for convenience.
+                return _input.to(device=device, dtype=dtype)
+            if isinstance(_input, torch.Tensor):
+                return _input.to(device=device, dtype=dtype)
+            if isinstance(_input, list):
+                return [cls._move_to_device(v, device=device, dtype=dtype) for v in _input]
+            warnings.warn("Instance type '{}' not supported! Input remains on current device!".format(type(_input)),
+                          Warning)
+            return _input
+
+        def forward(self, img_pairs, t0, t1):
+            I0 = self._move_to_device(img_pairs[0], self.device)
+            I1 = self._move_to_device(img_pairs[1], self.device)
+            total_frames = []
+            timestamps = []
+
+            flowout = self.flowComp(torch.cat((I0, I1), dim=1))
+            F_0_1 = flowout[:, :2, :, :]
+            F_1_0 = flowout[:, 2:, :, :]
+            self._upsample_adaptive(I0, I1, t0, t1, F_0_1, F_1_0, total_frames, timestamps)
+
+            return total_frames, timestamps
+
+        def _upsample_adaptive(self,
+                               I0: torch.Tensor,
+                               I1: torch.Tensor,
+                               time0: torch.Tensor,
+                               time1: torch.Tensor,
+                               F_0_1: torch.Tensor,
+                               F_1_0: torch.Tensor,
+                               total_frames: List[torch.Tensor],
+                               timestamps: List[float]):
+            B, _, _, _ = F_0_1.shape
+
+            flow_mag_0_1_max, _ = F_0_1.pow(2).sum(1).pow(.5).view(B, -1).max(-1)
+            flow_mag_1_0_max, _ = F_1_0.pow(2).sum(1).pow(.5).view(B, -1).max(-1)
+
+            flow_mag_max, _ = torch.stack([flow_mag_0_1_max, flow_mag_1_0_max]).max(0)
+            flow_mag_max = torch.ceil(flow_mag_max).int()
+
+            for i in range(B):
+                for intermediateIndex in range(1, flow_mag_max[i].item()):
+                    t = float(intermediateIndex) / flow_mag_max[i].item()
+                    temp = -t * (1 - t)
+                    fCoeff = [temp, t * t, (1 - t) * (1 - t), temp]
+
+                    F_t_0 = fCoeff[0] * F_0_1 + fCoeff[1] * F_1_0
+                    F_t_1 = fCoeff[2] * F_0_1 + fCoeff[3] * F_1_0
+
+                    height, width = I0.shape[-2:]
+                    flow_back_warp = self.get_flowBackWarp_module(width, height)
+                    g_I0_F_t_0 = flow_back_warp(I0, F_t_0)
+                    g_I1_F_t_1 = flow_back_warp(I1, F_t_1)
+
+                    intrpOut = self.ArbTimeFlowIntrp(
+                        torch.cat((I0, I1, F_0_1, F_1_0, F_t_1, F_t_0, g_I1_F_t_1, g_I0_F_t_0), dim=1))
+                    F_t_0_f = intrpOut[:, :2, :, :] + F_t_0
+                    F_t_1_f = intrpOut[:, 2:4, :, :] + F_t_1
+                    V_t_0 = torch.sigmoid(intrpOut[:, 4:5, :, :])
+                    V_t_1 = 1 - V_t_0
+
+                    g_I0_F_t_0_f = flow_back_warp(I0, F_t_0_f)
+                    g_I1_F_t_1_f = flow_back_warp(I1, F_t_1_f)
+
+                    wCoeff = [1 - t, t]
+
+                    Ft_p = (wCoeff[0] * V_t_0 * g_I0_F_t_0_f + wCoeff[1] * V_t_1 * g_I1_F_t_1_f) / (
+                            wCoeff[0] * V_t_0 + wCoeff[1] * V_t_1)
+
+                    Ft_p_norm = Ft_p[i] - self.negmean
+
+                    total_frames += [Ft_p_norm]
+                    timestamps += [(time0 + t * (time1 - time0))]
+
+        def get_flowBackWarp_module(self, width: int, height: int):
+            module = self.flowBackWarp_dict.get((width, height))
+            if module is None:
+                module = backWarp(width, height, self.device)
+                self._move_to_device(module, self.device)
+                self.flowBackWarp_dict[(width, height)] = module
+            assert module is not None
+            return module
+
+
 
     def _load_net_from_checkpoint(self):
         ckpt_file = 'checkpoint/SuperSloMo.ckpt'
