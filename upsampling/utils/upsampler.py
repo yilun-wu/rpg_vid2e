@@ -15,15 +15,21 @@ from .const import mean, std, imgs_dirname
 from .model import UNet, backWarp
 from .utils import get_sequence_or_none
 
+from andante.compute import gpu
+import random
+
 
 class Upsampler:
     _timestamps_filename = 'timestamps.txt'
 
     def __init__(self, input_dir: str, output_dir: str, device: str):
+        device = os.environ.get('device')
+        if device != "cpu":
+            device = 'cuda:'+str(random.choice(gpu.GPUCluster().get_free_gpus()))
         assert os.path.isdir(input_dir), 'The input directory must exist'
-        assert not os.path.exists(output_dir), 'The output directory must not exist'
+        #assert not os.path.exists(output_dir), 'The output directory must not exist'
 
-        self._prepare_output_dir(input_dir, output_dir)
+        #self._prepare_output_dir(input_dir, output_dir)
         self.src_dir = input_dir
         self.dest_dir = output_dir
 
@@ -82,7 +88,9 @@ class Upsampler:
             reldirpath = os.path.relpath(src_absdirpath, self.src_dir)
             dest_imgs_dir = os.path.join(self.dest_dir, reldirpath, imgs_dirname)
             dest_timestamps_filepath = os.path.join(self.dest_dir, reldirpath, self._timestamps_filename)
-            self.upsample_sequence(sequence, dest_imgs_dir, dest_timestamps_filepath)
+            if not os.path.isfile(os.path.join(self.dest_dir, reldirpath, 'COMPLETED')):
+                self.upsample_sequence(sequence, dest_imgs_dir, dest_timestamps_filepath)
+                self._write_complete(os.path.join(self.dest_dir, reldirpath, "COMPLETED"))
 
     def upsample_sequence(self, sequence: Sequence, dest_imgs_dir: str, dest_timestamps_filepath: str):
         os.makedirs(dest_imgs_dir, exist_ok=True)
@@ -137,6 +145,11 @@ class Upsampler:
     def _write_timestamps(timestamps: list, timestamps_filename: str):
         with open(timestamps_filename, 'w') as t_file:
             t_file.writelines([str(t) + '\n' for t in timestamps])
+
+    @staticmethod
+    def _write_complete(complete_file):
+        with open(complete_file, 'w'):
+            pass
 
     @staticmethod
     def _to_numpy_image(img: torch.Tensor):
