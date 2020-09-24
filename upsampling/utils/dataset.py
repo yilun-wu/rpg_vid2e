@@ -7,12 +7,13 @@ from PIL import Image
 import skvideo.io
 import torch
 import torchvision.transforms as transforms
-
+from torch.utils.data import Dataset
 from .const import mean, std, img_formats
 
 
-class Sequence:
+class Sequence(Dataset):
     def __init__(self):
+        super(Sequence, self).__init__()
         normalize = transforms.Normalize(mean=mean, std=std)
         self.transform = transforms.Compose([transforms.ToTensor(), normalize])
 
@@ -41,6 +42,16 @@ class ImageSequence(Sequence):
     @classmethod
     def _is_img_file(cls, path: str):
         return Path(path).suffix.lower() in img_formats
+
+    def __getitem__(self, idx):
+        file_paths = self._get_path_from_name([self.file_names[idx], self.file_names[idx + 1]])
+        imgs = list()
+        for file_path in file_paths:
+            img = self._pil_loader(file_path)
+            img = self.transform(img)
+            imgs.append(img)
+        times_sec = [idx / self.fps, (idx + 1) / self.fps]
+        return imgs, times_sec
 
     def __next__(self):
         for idx in range(0, len(self.file_names) - 1):
