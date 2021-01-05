@@ -147,8 +147,8 @@ Eigen::MatrixXd EventSimulator::generateFromFolder(std::string image_folder, std
 void EventSimulator::init(const cv::Mat &img, double time)
 {
   is_initialized_ = true;
-  last_img_ = img;
-  ref_values_ = img;
+  last_img_ = img.clone();
+  ref_values_ = img.clone();
 
   last_event_timestamp_ = cv::Mat::zeros(img.size[0], img.size[1], CV_64F);
 
@@ -197,7 +197,7 @@ void EventSimulator::imageCallback(const cv::Mat& img, double time, std::vector<
                     {
                         const double edt = (curr_cross - it) * delta_t / (itdt - it);
                         const double t = current_time_ + edt;
-      
+
                         const double last_stamp_at_xy = last_event_timestamp_.at<double>(y,x);
                         
                         const double dt = t - last_stamp_at_xy;
@@ -207,7 +207,7 @@ void EventSimulator::imageCallback(const cv::Mat& img, double time, std::vector<
                             new_events.emplace_back(x, y,t,pol);
                             last_event_timestamp_.at<double>(y,x) = t;
                         }
-                     
+
                         ref_values_.at<float>(y,x) = curr_cross;
                     }
                     else
